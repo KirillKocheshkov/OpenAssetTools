@@ -35,6 +35,7 @@
 #include "Asset/AssetRegistration.h"
 #include "Utils/Alignment.h"
 #include "Utils/Logging/Log.h"
+#include "Utils/PathUtils.h"
 #include "Utils/QuatInt16.h"
 #include "Utils/StringUtils.h"
 #include "XModel/Gltf/GltfBinInput.h"
@@ -60,9 +61,11 @@
 #include <algorithm>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <utility>
 #include <vector>
 
 using namespace GAME;
@@ -943,6 +946,372 @@ namespace
             return true;
         }
 
+#ifdef FEATURE_IW3
+        // Reconstructs XModel::collSurfs (the per-triangle bullet-collision data: plane + svec + tvec per
+        // triangle, grouped by bone) for the lod designated as collLod. Historically this data was never
+        // produced for xmodels loaded from raw (see https://github.com/Laupetin/OpenAssetTools/issues/812),
+        // which is harmless for render/vis but makes bullets pass straight through the model in-game.
+        // The math here was recovered from and verified against the original tool (xmodel.dll, the
+        // "buildmds.cpp"/"collvec.cpp" converter used by the stock Asset Manager) and cross-checked against
+        // real collLod geometry from retail IW3 assets.
+        struct CollPlane
+        {
+            Eigen::Vector3f normal;
+            float d;
+        };
+
+        [[nodiscard]] static std::optional<CollPlane>
+            BuildCollPlane(const Eigen::Vector3f& v0, const Eigen::Vector3f& v1, const Eigen::Vector3f& v2)
+        {
+            const Eigen::Vector3f e1 = v1 - v0;
+            const Eigen::Vector3f e2 = v2 - v0;
+            const Eigen::Vector3f normalRaw = e2.cross(e1);
+            const auto lenSq = normalRaw.squaredNorm();
+
+            // Degenerate (zero-area) triangle: the stock converter rejects these with
+            // "Degenerate tri on collision LOD" and simply excludes them from the collSurf.
+            constexpr auto DEGENERATE_EPSILON = 1e-10f;
+            if (lenSq < DEGENERATE_EPSILON)
+                return std::nullopt;
+
+            const Eigen::Vector3f normal = normalRaw / std::sqrt(lenSq);
+            return CollPlane{normal, normal.dot(v0)};
+        }
+
+        // Builds one of the two "collision vectors" (svec/tvec) of a collision triangle. Each is a 4-float
+        // (axis, offset) pair such that dot(point, vec.xyz) + vec.w is a linear barycentric-style coordinate
+        // of the triangle: 0 along the edge the vector was built from, -1 at the opposite vertex. svec is
+        // built from edge (v2-v0) with v1 as the "opposite" vertex; tvec from edge (v1-v0) with v2 opposite.
+        [[nodiscard]] static std::optional<std::array<float, 4>> BuildCollVec(const Eigen::Vector3f& planeNormal,
+                                                                                const Eigen::Vector3f& edge,
+                                                                                const Eigen::Vector3f& edgeStart,
+                                                                                const Eigen::Vector3f& edgeEnd,
+                                                                                const Eigen::Vector3f& opposite)
+        {
+            const Eigen::Vector3f c = planeNormal.cross(edge);
+            const auto k1 = 0.5f * (edgeStart + edgeEnd).dot(c);
+            const auto k = k1 - opposite.dot(c);
+
+            constexpr auto DEGENERATE_EPSILON = 1e-10f;
+            if (std::abs(k) < DEGENERATE_EPSILON)
+                return std::nullopt;
+
+            // Sign convention verified against retail-compiled collSurfs (zombie in a known-good zone,
+            // ~39800 triangles compared): the stored xyz is the NEGATION of c/k while w stays -k1/k, i.e. the
+            // engine evaluates s = w - dot(xyz, p). Storing +c/k here mirrors the barycentric test and makes
+            // bullets register only at scattered spots.
+            return std::array<float, 4>{-c.x() / k, -c.y() / k, -c.z() / k, -k1 / k};
+        }
+
+        // collSurf.surfFlags = (surface type index << 20), where the index is the 1-based position of the
+        // lowest set bit of material->info.surfaceTypeBits (0 = no surface type / "default"). Verified
+        // against retail: zombie_skin surfaceTypeBits=64 -> index 7 (flesh) -> 0x700000, matching the
+        // compiled zombie asset. Other low bits seen in retail (e.g. 0x20 on blackhawk) are not understood
+        // and are not reproduced.
+        [[nodiscard]] static int SurfFlagsFromMaterial(const Material* material)
+        {
+            if (!material)
+                return 0;
+
+            const auto bits = static_cast<unsigned>(material->info.surfaceTypeBits);
+            if (bits == 0u)
+                return 0;
+
+            auto index = 1u;
+            auto mask = bits;
+            while ((mask & 1u) == 0u)
+            {
+                mask >>= 1u;
+                index++;
+            }
+
+            return static_cast<int>(index << 20u);
+        }
+
+        // A collision-lod triangle must be rigidly attached to exactly one bone (no blend weights); mirrors
+        // the stock converter's "Can not have deforming triangles on collision LOD" check. Returns the
+        // shared bone index, or nullopt plus a reason string ("non-rigid"/"mixed-bone") usable for logging.
+        [[nodiscard]] static std::pair<std::optional<unsigned>, const char*> GetRigidBoneForFace(const XModelFace& face, const XModelCommon& common)
+        {
+            std::optional<unsigned> boneIndex;
+            for (const auto vertexIndex : face.vertexIndex)
+            {
+                const auto& vertexWeights = common.m_vertex_bone_weights[vertexIndex];
+                if (vertexWeights.weightCount != 1)
+                    return {std::nullopt, "vertex has blend weights (not rigid)"};
+
+                const auto bone = common.m_bone_weight_data.weights[vertexWeights.weightOffset].boneIndex;
+                if (boneIndex && *boneIndex != bone)
+                    return {std::nullopt, "triangle spans more than one bone"};
+
+                boneIndex = bone;
+            }
+
+            return {boneIndex, nullptr};
+        }
+
+        // Lists every bone name touched (through any blend weight) by a face's 3 vertices, for logging when
+        // a triangle is rejected for not being rigidly attached to a single bone.
+        [[nodiscard]] static std::string DescribeFaceBones(const XModelFace& face, const XModelCommon& common)
+        {
+            std::vector<std::string> names;
+            for (const auto vertexIndex : face.vertexIndex)
+            {
+                const auto& vertexWeights = common.m_vertex_bone_weights[vertexIndex];
+                for (auto w = 0u; w < vertexWeights.weightCount; w++)
+                {
+                    const auto& boneName = common.m_bones[common.m_bone_weight_data.weights[vertexWeights.weightOffset + w].boneIndex].name;
+                    if (std::ranges::find(names, boneName) == names.end())
+                        names.emplace_back(boneName);
+                }
+            }
+
+            std::string result;
+            for (const auto& name : names)
+            {
+                if (!result.empty())
+                    result += ", ";
+                result += name;
+            }
+
+            return result;
+        }
+
+        // Appends one line to build_result.txt, placed next to the running executable (Linker.exe /
+        // Unlinker.exe / a test binary) rather than in the current working directory - this tool gets
+        // invoked from varying working directories, so a path relative to the executable's own folder is
+        // the only location that's reliably findable afterwards. This is purely a diagnostic aid for
+        // inspecting which xmodels had their collision lod processed (every one that reaches
+        // BuildCollisionSurfaces gets exactly one summary line, success or failure) and which triangles
+        // were excluded and why; it is not part of the asset data itself and failure to write it is never
+        // fatal.
+        static void LogCollisionEvent(const std::string& line)
+        {
+            std::filesystem::path logPath("build_result.txt");
+            try
+            {
+                logPath = std::filesystem::path(utils::GetExecutablePath()).parent_path() / "build_result.txt";
+            }
+            catch (const std::exception&)
+            {
+                // Fall back to the current working directory if we can't resolve the executable path.
+            }
+
+            std::ofstream logFile(logPath, std::ios::app);
+            if (!logFile.is_open())
+                return;
+
+            logFile << line << "\n";
+        }
+
+        [[nodiscard]] static std::string FormatVec(const Eigen::Vector3f& v)
+        {
+            return std::format("({:.3f}, {:.3f}, {:.3f})", v.x(), v.y(), v.z());
+        }
+
+        bool BuildCollisionSurfaces(XModel& xmodel, const XModelCommon& common, const std::vector<Material*>& materialAssets)
+        {
+            struct CollSurfBucket
+            {
+                unsigned boneIndex;
+                unsigned materialIndex;
+                std::vector<XModelCollTri_s> tris;
+                Eigen::Vector3f mins{
+                    std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
+                Eigen::Vector3f maxs{
+                    std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest()};
+            };
+
+            std::vector<CollSurfBucket> buckets;
+            const auto findOrAddBucket = [&buckets](const unsigned boneIndex, const unsigned materialIndex) -> CollSurfBucket&
+            {
+                for (auto& bucket : buckets)
+                {
+                    if (bucket.boneIndex == boneIndex && bucket.materialIndex == materialIndex)
+                        return bucket;
+                }
+
+                auto& bucket = buckets.emplace_back();
+                bucket.boneIndex = boneIndex;
+                bucket.materialIndex = materialIndex;
+                return bucket;
+            };
+
+            auto skippedFaces = 0u;
+            auto totalFaces = 0u;
+
+            for (const auto& object : common.m_objects)
+            {
+                for (const auto& face : object.m_faces)
+                {
+                    totalFaces++;
+
+                    // Note: vertex coordinates are used as-is (model/world space), not transformed into a
+                    // bone-relative frame. This matches how rigid vertex positions are already stored
+                    // elsewhere in this loader (see CreateVertex: verts0.xyz = commonVertex.coordinates,
+                    // untransformed) - bone.globalOffset/globalRotation here are not a meaningful per-bone
+                    // pose to undo, they can carry an unrelated root-level axis-convention rotation picked
+                    // up from the glTF (Y-up) <-> engine (Z-up) conversion, which must NOT be applied to
+                    // collision geometry that already lives in final model space.
+                    const auto toWorld = [](const XModelVertex& vertex)
+                    { return Eigen::Vector3f(vertex.coordinates[0], vertex.coordinates[1], vertex.coordinates[2]); };
+
+                    const auto v0 = toWorld(common.m_vertices[face.vertexIndex[0]]);
+                    const auto v1 = toWorld(common.m_vertices[face.vertexIndex[1]]);
+                    const auto v2 = toWorld(common.m_vertices[face.vertexIndex[2]]);
+
+                    const auto [rigidBone, rigidFailReason] = GetRigidBoneForFace(face, common);
+                    if (!rigidBone)
+                    {
+                        skippedFaces++;
+                        LogCollisionEvent(std::format("[{}] SKIPPED triangle in object \"{}\": {} | bones involved: {} | verts={} {} {}",
+                                                       xmodel.name,
+                                                       object.name,
+                                                       rigidFailReason,
+                                                       DescribeFaceBones(face, common),
+                                                       FormatVec(v0),
+                                                       FormatVec(v1),
+                                                       FormatVec(v2)));
+                        continue;
+                    }
+
+                    const auto& boneName = common.m_bones[*rigidBone].name;
+
+                    const auto plane = BuildCollPlane(v0, v1, v2);
+                    if (!plane)
+                    {
+                        skippedFaces++;
+                        LogCollisionEvent(std::format(
+                            "[{}] SKIPPED triangle in object \"{}\" on bone \"{}\": degenerate (zero-area) plane | verts={} {} {}",
+                            xmodel.name,
+                            object.name,
+                            boneName,
+                            FormatVec(v0),
+                            FormatVec(v1),
+                            FormatVec(v2)));
+                        continue;
+                    }
+
+                    const auto svec = BuildCollVec(plane->normal, v2 - v0, v0, v2, v1);
+                    const auto tvec = BuildCollVec(plane->normal, v1 - v0, v0, v1, v2);
+                    if (!svec || !tvec)
+                    {
+                        skippedFaces++;
+                        LogCollisionEvent(std::format(
+                            "[{}] SKIPPED triangle in object \"{}\" on bone \"{}\": degenerate svec/tvec | verts={} {} {}",
+                            xmodel.name,
+                            object.name,
+                            boneName,
+                            FormatVec(v0),
+                            FormatVec(v1),
+                            FormatVec(v2)));
+                        continue;
+                    }
+
+                    XModelCollTri_s collTri{};
+                    collTri.plane[0] = plane->normal.x();
+                    collTri.plane[1] = plane->normal.y();
+                    collTri.plane[2] = plane->normal.z();
+                    collTri.plane[3] = plane->d;
+                    std::ranges::copy(*svec, collTri.svec);
+                    std::ranges::copy(*tvec, collTri.tvec);
+
+                    auto& bucket = findOrAddBucket(*rigidBone, object.materialIndex);
+                    bucket.tris.emplace_back(collTri);
+
+                    for (const auto& v : {v0, v1, v2})
+                    {
+                        bucket.mins = bucket.mins.cwiseMin(v);
+                        bucket.maxs = bucket.maxs.cwiseMax(v);
+                    }
+                }
+            }
+
+            // Unconditional summary - every xmodel whose collision lod reaches this point gets exactly one
+            // of these lines, so build_result.txt can always answer "did this model's collision even get
+            // (re)built this run" instead of only showing up when something went wrong.
+            LogCollisionEvent(std::format("[{}] collision lod processed: {} face(s) seen, {} skipped, {} collSurf bucket(s) produced",
+                                           xmodel.name,
+                                           totalFaces,
+                                           skippedFaces,
+                                           buckets.size()));
+
+            if (skippedFaces > 0u)
+            {
+                con::warn("Collision lod of xmodel \"{}\" had {} triangle(s) excluded from collision (not rigidly "
+                          "attached to a single bone, or degenerate) - see build_result.txt for details",
+                          xmodel.name,
+                          skippedFaces);
+                LogCollisionEvent(
+                    std::format("[{}] total triangles excluded from collision lod: {}", xmodel.name, skippedFaces));
+            }
+
+            if (buckets.empty())
+            {
+                con::error("Collision lod of xmodel \"{}\" produced ZERO collision surfaces (every triangle was "
+                           "rejected) - this model will have no bullet collision at all. See build_result.txt.",
+                           xmodel.name);
+                LogCollisionEvent(std::format("[{}] ERROR: zero collision surfaces produced, model has no collision", xmodel.name));
+                return true;
+            }
+
+            xmodel.numCollSurfs = static_cast<int>(buckets.size());
+            xmodel.collSurfs = m_memory.Alloc<XModelCollSurf_s>(buckets.size());
+
+            // Verified against real retail-compiled collSurfs (by loading the actual compiled XModel asset
+            // out of a known-good zone, not by guessing): collSurf.contents is the constant 1 for every
+            // single collSurf bucket in every rigid xmodel checked (zombie, zom_makron, com_bomb_objective,
+            // vehicle_blackhawk_hero_sas, weapon_minigun, shaneys_chute_i), regardless of material - it is
+            // NOT a Quake III-style CONTENTS_BODY bitmask (0x2000000), that was an unverified guess from a
+            // different engine family and is wrong: it is why bullet traces stopped registering hits against
+            // this geometry even though the triangle data itself was valid. collSurf.surfFlags is derived
+            // from the material's surface type, see SurfFlagsFromMaterial. (The actual cause of the missing
+            // hits was the inverted svec/tvec xyz sign, see BuildCollVec.)
+            constexpr auto XMODEL_COLLSURF_CONTENTS = 1;
+
+            auto aggregateContents = 0;
+            for (auto bucketIndex = 0u; bucketIndex < buckets.size(); bucketIndex++)
+            {
+                const auto& bucket = buckets[bucketIndex];
+                auto& collSurf = xmodel.collSurfs[bucketIndex];
+
+                collSurf.numCollTris = static_cast<int>(bucket.tris.size());
+                collSurf.collTris = m_memory.Alloc<XModelCollTri_s>(bucket.tris.size());
+                memcpy(collSurf.collTris, bucket.tris.data(), sizeof(XModelCollTri_s) * bucket.tris.size());
+
+                collSurf.mins[0] = bucket.mins.x();
+                collSurf.mins[1] = bucket.mins.y();
+                collSurf.mins[2] = bucket.mins.z();
+                collSurf.maxs[0] = bucket.maxs.x();
+                collSurf.maxs[1] = bucket.maxs.y();
+                collSurf.maxs[2] = bucket.maxs.z();
+                collSurf.boneIdx = static_cast<int>(bucket.boneIndex);
+
+                collSurf.contents = XMODEL_COLLSURF_CONTENTS;
+                collSurf.surfFlags =
+                    bucket.materialIndex < materialAssets.size() ? SurfFlagsFromMaterial(materialAssets[bucket.materialIndex]) : 0;
+
+                aggregateContents |= collSurf.contents;
+
+                const auto& boneName =
+                    bucket.boneIndex < common.m_bones.size() ? common.m_bones[bucket.boneIndex].name : std::string("<out of range>");
+                LogCollisionEvent(std::format("[{}] collSurf {}: bone \"{}\" (idx {}), {} tri(s), mins={} maxs={}",
+                                               xmodel.name,
+                                               bucketIndex,
+                                               boneName,
+                                               bucket.boneIndex,
+                                               bucket.tris.size(),
+                                               FormatVec(bucket.mins),
+                                               FormatVec(bucket.maxs)));
+            }
+
+            xmodel.contents = aggregateContents;
+            LogCollisionEvent(std::format(
+                "[{}] collision build complete: {} collSurf(s), aggregate contents=0x{:x}", xmodel.name, buckets.size(), aggregateContents));
+            return true;
+        }
+#endif
+
         bool LoadLod(const JsonXModel& jXModel,
                 const JsonXModelLod& jLod,
                 XModel& xmodel,
@@ -1035,6 +1404,14 @@ namespace
                 for (auto i = 0u; i < std::extent_v<decltype(XModelLodInfo::partBits)>; i++)
                     lodInfo.partBits[i] |= surface.partBits[i];
             }
+
+#ifdef FEATURE_IW3
+            if (jXModel.collLod && jXModel.collLod.value() >= 0 && static_cast<unsigned>(jXModel.collLod.value()) == lodNumber)
+            {
+                if (!BuildCollisionSurfaces(xmodel, *common, materialAssets))
+                    return false;
+            }
+#endif
 
 #if defined(FEATURE_IW4) || defined(FEATURE_IW5)
             auto* modelSurfs = m_memory.Alloc<XModelSurfs>();
